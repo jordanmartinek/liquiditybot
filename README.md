@@ -50,9 +50,31 @@ install needed). Python 3.9+ (developed/tested on 3.11).
 
 ```bash
 # from the project root
-python3 -m unittest discover -s tests -v     # run the risk-engine tests
+python3 -m unittest discover -s tests -v     # run all tests (risk engine + strategy + datafeed)
 python3 examples/demo.py                      # end-to-end pipeline on synthetic data
+python3 examples/backtest_real.py --help      # backtest runner: csv | ccxt | synthetic sources
 ```
+
+### Backtesting on real data (M2 data feed)
+
+`src/liq_ai_bot/datafeed.py` turns real historical perp OHLCV into `Bar`s behind
+one interface, with three interchangeable sources:
+
+```bash
+# offline smoke (works anywhere, incl. no-network sandboxes)
+python3 examples/backtest_real.py --source synthetic --bars 4000
+
+# fetch real perp history once where PyPI + network are available, save for replay
+#   (needs: pip install ccxt)
+python3 examples/backtest_real.py --source ccxt --symbol BTC/USDT:USDT \
+    --timeframe 15m --bars 5000 --save data/btc_15m.csv
+
+# replay real data offline, deterministically, forever
+python3 examples/backtest_real.py --source csv --path data/btc_15m.csv --timeframe 15m
+```
+
+`ccxt` is imported lazily, so the package still runs on the standard library
+alone when you stick to the `csv`/`synthetic` sources.
 
 `requirements.txt` / the `pyproject.toml` optional-deps list the **target** stack
 for M2+ (pandas, numpy, ccxt, pydantic; scikit-learn/lightgbm for the ML filter).
@@ -62,7 +84,7 @@ by the M1 code.
 ## Roadmap
 
 - **M1 (done):** scaffold — config/RULES, risk engine, strategy interfaces, backtest + Monte-Carlo, tests.
-- **M2:** port full level/confluence logic from the Pine indicator; real historical perp data; backtest for real.
+- **M2 (in progress):** real historical perp data feed (`datafeed.py`: csv/ccxt/synthetic) + real-data backtest runner + strategy/datafeed tests **[done]**; port full level/confluence logic from the Pine indicator **[next]**.
 - **M3:** Monte-Carlo challenge sim through the risk layer → P(pass)/P(breach).
 - **M4:** walk-forward + cost modeling → go/no-go on the base edge.
 - **M5 (only if M4 passes):** optional ML setup-filter trained on the journaled dataset.
