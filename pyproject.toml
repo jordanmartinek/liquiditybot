@@ -1,0 +1,27 @@
+[project]
+name = "liq-ai-bot"
+version = "0.1.0"
+description = "Rules-first automated trading system from the liquidity strategy, engineered for a MyFundedPerps crypto-perps prop challenge. R&D scaffold."
+requires-python = ">=3.9"
+
+# NOTE: The M1 scaffold runs on the Python STANDARD LIBRARY ONLY so it works
+# in an offline sandbox. The dependencies below are the *target* stack for
+# M2+ (data feed, backtest at scale, ML filter) and are intentionally NOT
+# imported at module load. Install them only in an environment with network
+# access to PyPI.
+[project.optional-dependencies]
+data = ["pandas>=2.0", "numpy>=1.24", "ccxt>=4.0"]
+config = ["pydantic>=2.0"]
+ml = ["scikit-learn>=1.3", "lightgbm>=4.0"]
+dev = ["pytest>=7.0", "ruff", "black", "mypy"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
