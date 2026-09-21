@@ -86,6 +86,26 @@ python3 examples/backtest_real.py --source csv --path data/btc_15m.csv --timefra
 `ccxt` is imported lazily, so the package still runs on the standard library
 alone when you stick to the `csv`/`synthetic` sources.
 
+### Walk-forward validation (M3/M4) — the go/no-go gate
+
+Proves (or retires) the edge: tunes params in-sample, evaluates out-of-sample,
+sweeps costs, and prints a GO / NO-GO verdict under the confirmed prop rules.
+
+```bash
+# offline smoke (numbers meaningless, but exercises the whole pipeline)
+python3 examples/walkforward.py --source synthetic --bars 4000 \
+    --train 800 --test 300 --embargo 20
+
+# real validation: fetch once (networked env), then validate offline
+python3 examples/backtest_real.py --source ccxt --symbol BTC/USDT:USDT \
+    --timeframe 15m --bars 20000 --save data/btc_15m.csv
+python3 examples/walkforward.py --source csv --path data/btc_15m.csv \
+    --timeframe 15m --train 3000 --test 1000 --embargo 50
+```
+
+A **NO-GO is the expected, correct output** until the strategy demonstrates a real
+edge on real out-of-sample data. The harness is built to say NO plainly.
+
 `requirements.txt` / the `pyproject.toml` optional-deps list the **target** stack
 for M2+ (pandas, numpy, ccxt, pydantic; scikit-learn/lightgbm for the ML filter).
 Install those only in an environment with PyPI access — they are **not** imported
@@ -95,6 +115,7 @@ by the M1 code.
 
 - **M1 (done):** scaffold — config/RULES, risk engine, strategy interfaces, backtest + Monte-Carlo, tests.
 - **M2 (done):** real historical perp data feed (`datafeed.py`: csv/ccxt/synthetic) + real-data backtest runner; **full level/confluence port** from the Pine indicator (`levels.py`: PDH/PDL, PWH/PWL, PMH/PML, sessions, swings +HTF, equal highs/lows, order blocks, dealing-range OTE, 0-100 confluence) wired into the strategy; tests throughout.
+- **M3/M4 (done):** walk-forward validation harness (`walkforward.py`) — train/test splitter with embargo, in-sample param tuning, pooled out-of-sample evaluation, cost-sensitivity sweep, and a GO/NO-GO verdict combining OOS edge + overfit decay + cost survival + Monte-Carlo P(pass)/P(breach). Runner: `examples/walkforward.py`. **Needs real perp data for a meaningful verdict.**
 - **M3:** Monte-Carlo challenge sim through the risk layer → P(pass)/P(breach).
 - **M4:** walk-forward + cost modeling → go/no-go on the base edge.
 - **M5 (only if M4 passes):** optional ML setup-filter trained on the journaled dataset.
