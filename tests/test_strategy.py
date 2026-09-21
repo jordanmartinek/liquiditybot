@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from liq_ai_bot.levels import LevelParams  # noqa: E402
 from liq_ai_bot.strategy import (  # noqa: E402
     DOLParams, Rolling, SignalParams, compute_dol, LiquiditySFPStrategy,
 )
@@ -128,25 +129,28 @@ class TestComputeDOL(unittest.TestCase):
 class TestSFPTrigger(unittest.TestCase):
     """Drive the full LiquiditySFPStrategy.on_bar path with hand-built bars.
 
-    We manually seed a sell-side level (a low) plus a buy-side target above, then
-    warm up ATR/volume with flat bars, then fire a sweep-and-reclaim bar and assert
-    a LONG setup with a sane stop/target is produced.
+    The M2 engine auto-seeds a real level map from the bar stream, so to test the
+    SFP *trigger* in isolation we suppress auto-seeding (a LevelEngine with a very
+    long swing pivot so no pivots confirm on the short warmup, and sessions that
+    won't produce competing pools within the flat window) and drive the trigger off
+    a manually-seeded SSL/BSL pair. Level seeding itself is covered by
+    test_levels.py.
     """
 
-    def _make_strategy(self):
-        # loosen gates that would otherwise need a long warmup / rich level map
+    def _make_strategy(self, seed_target=True, low_conf=False):
         params = SignalParams(rvol_min=1.2, confluence_min=40.0, conviction_min=0.2,
                               stop_pad_atr=0.25, fallback_r=2.0)
-        strat = LiquiditySFPStrategy(symbol="TEST/USDT:USDT", params=params)
-        # Seed the map explicitly (bypass the stubbed auto-seeding for determinism):
-        #  - SSL pool (a low) at 99.0 that price will sweep and reclaim
-        #  - BSL pool (a high) at 110.0 that becomes the DOL magnet / target
-        strat.add_level(Level(99.0, LevelType.SWING_L, PoolSide.SSL, birth_ts=0, confluence=60))
-        strat.add_level(Level(110.0, LevelType.SWING_H, PoolSide.BSL, birth_ts=0, confluence=60))
+        # auto_seed=False => run purely off manual levels (isolate the SFP trigger)
+        strat = LiquiditySFPStrategy("TEST/USDT:USDT", params=params, auto_seed=False)
+        conf = 10 if low_conf else 60
+        strat.add_level(Level(99.0, LevelType.SWING_L, PoolSide.SSL, birth_ts=0, confluence=conf))
+        if seed_target:
+            # BSL magnet above -> DOL points up and gives the SFP a target
+            strat.add_level(Level(110.0, LevelType.SWING_H, PoolSide.BSL, birth_ts=0, confluence=60))
         return strat
 
     def _warmup(self, strat, n=20, price=100.0):
-        # flat, low-volume bars so ATR is well-defined and the SSL stays un-swept
+        # flat, low-volume bars: ATR well-defined; the 99.0 SSL stays un-swept
         for i in range(n):
             strat.on_bar(bar(i, price, price + 0.5, price - 0.5, price, v=1000))
 
@@ -157,19 +161,24 @@ class TestSFPTrigger(unittest.TestCase):
         setup = strat.on_bar(bar(100, 100.0, 100.5, 98.0, 100.2, v=5000))
         self.assertIsNotNone(setup, "expected a LONG SFP setup on sweep+reclaim")
         self.assertEqual(setup.side, Side.LONG)
-        # stop must sit below the sweep wick (with ATR padding)
-        self.assertLess(setup.stop, 98.0)
-        # target should be the opposing BSL pool at 110 (the DOL magnet)
+        self.assertLess(setup.stop, 98.0)          # stop below the sweep wick
+        # target is the opposing BSL pool above (the DOL magnet)
         self.assertEqual(setup.target, 110.0)
-        # features carried for journaling / the future ML filter
         self.assertIn("rvol", setup.features)
         self.assertIn("dol_conviction", setup.features)
         self.assertGreater(setup.entry, setup.stop)
 
+    def test_no_trigger_without_opposing_pool_for_dol(self):
+        """With no BSL pool above, DOL cannot point up, so the DOL-agreement gate
+        blocks the long (the target's magnet and the bias share the same pool)."""
+        strat = self._make_strategy(seed_target=False)
+        self._warmup(strat, n=20, price=100.0)
+        setup = strat.on_bar(bar(100, 100.0, 100.5, 98.0, 100.2, v=5000))
+        self.assertIsNone(setup)
+
     def test_no_trigger_without_volume(self):
         strat = self._make_strategy()
         self._warmup(strat, n=20, price=100.0)
-        # same sweep+reclaim, but volume is normal -> rvol gate blocks it
         setup = strat.on_bar(bar(100, 100.0, 100.5, 98.0, 100.2, v=1000))
         self.assertIsNone(setup)
 
@@ -181,23 +190,20 @@ class TestSFPTrigger(unittest.TestCase):
         self.assertIsNone(setup)
 
     def test_no_trigger_when_dol_opposes(self):
-        """If the only pools bias DOL downward, a bullish sweep+reclaim is filtered
-        out (DOL-agreement gate). Seed only a strong SSL below and no BSL above."""
+        """A dominant opposing pool keeps DOL pointing DOWN, filtering out a bullish
+        sweep+reclaim (DOL-agreement gate)."""
         params = SignalParams(rvol_min=1.2, confluence_min=40.0, conviction_min=0.2)
-        strat = LiquiditySFPStrategy(symbol="TEST/USDT:USDT", params=params)
+        strat = LiquiditySFPStrategy("TEST/USDT:USDT", params=params, auto_seed=False)
         strat.add_level(Level(99.0, LevelType.SWING_L, PoolSide.SSL, birth_ts=0, confluence=60))
-        # a much stronger SSL far below keeps DOL pointing DOWN even after the sweep
-        strat.add_level(Level(80.0, LevelType.EQ_L, PoolSide.SSL, birth_ts=0, confluence=90))
+        # a strong, near EQ_L just below price dominates the pull -> DOL DOWN
+        strat.add_level(Level(98.6, LevelType.EQ_L, PoolSide.SSL, birth_ts=0, confluence=95))
         self._warmup(strat, n=20, price=100.0)
-        setup = strat.on_bar(bar(100, 100.0, 100.5, 98.0, 100.2, v=5000))
+        # sweep the 99.0 only (keep the 98.6 EQ_L intact so it still pulls down)
+        setup = strat.on_bar(bar(100, 100.0, 100.4, 98.7, 100.2, v=5000))
         self.assertIsNone(setup)
 
     def test_no_trigger_when_confluence_below_gate(self):
-        params = SignalParams(rvol_min=1.2, confluence_min=40.0, conviction_min=0.2)
-        strat = LiquiditySFPStrategy(symbol="TEST/USDT:USDT", params=params)
-        # swept level has LOW confluence (below the 40 gate) -> blocked
-        strat.add_level(Level(99.0, LevelType.SWING_L, PoolSide.SSL, birth_ts=0, confluence=10))
-        strat.add_level(Level(110.0, LevelType.SWING_H, PoolSide.BSL, birth_ts=0, confluence=60))
+        strat = self._make_strategy(low_conf=True)  # swept level confluence=10 < gate 40
         self._warmup(strat, n=20, price=100.0)
         setup = strat.on_bar(bar(100, 100.0, 100.5, 98.0, 100.2, v=5000))
         self.assertIsNone(setup)
