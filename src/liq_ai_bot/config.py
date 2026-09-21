@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Optional
+from typing import List, Optional
 
 
 class DrawdownType(str, Enum):
@@ -25,6 +25,77 @@ class Profile(str, Enum):
     SANDBOX = "sandbox"      # offline/backtest; placeholders allowed
     EVAL = "eval"            # challenge; requires confirmed rules
     FUNDED = "funded"        # funded; requires confirmed rules
+
+
+@dataclass(frozen=True)
+class AutomationPolicy:
+    """MyFundedPerps' confirmed automation rules, encoded as machine-checkable
+    guardrails rather than prose. Automation IS permitted, but ONLY through the
+    documented public API and only for ordinary (non-prohibited) trading.
+
+    The clauses map directly onto this bot's design (DESIGN.md §0, §3):
+      * documented API only — never touch the website's internal / browser-network
+        endpoints (i.e. no scraping the UI's private XHR calls);
+      * automation never exempts any ordinary trading rule (the risk/compliance
+        layer still applies in full);
+      * prohibited strategy classes stay prohibited when automated.
+
+    These are enforced by ``require_ready_for_live``: a config whose behavior
+    could fall into a prohibited class is refused before it can arm.
+    """
+
+    # Must route orders through the official/documented API surface only.
+    documented_api_only: bool = True
+    # Hard bans (all True == this bot must NOT do these).
+    forbid_internal_browser_endpoints: bool = True   # no UI/dev-tools/network XHR endpoints
+    forbid_hft: bool = True
+    forbid_latency_arbitrage: bool = True
+    forbid_quote_stuffing: bool = True
+    forbid_platform_exploitation: bool = True         # e.g. gaming simulated fills
+    forbid_cross_account_coordination: bool = True
+    forbid_risk_limit_circumvention: bool = True
+    # The firm may throttle strategies with excessive infra usage or execution
+    # behavior materially different from ordinary trading.
+    respect_infra_and_ordinary_execution: bool = True
+
+    def violations(self, settings: "Settings") -> list:
+        """Return reasons this configuration would breach the automation policy.
+
+        This is a *design-time* screen against the prohibited classes, using what
+        the config can reveal. It is necessarily conservative and NOT a substitute
+        for the firm's own monitoring — but it makes the obvious footguns fail
+        closed. Empty list == no detectable violation.
+        """
+        problems: List[str] = []
+        # HFT / quote-stuffing / latency-arb proxy: this is an on-closed-bar,
+        # one-position-at-a-time system. A sub-minute execution timeframe or
+        # many concurrent positions would drift toward the prohibited HFT class.
+        if self.forbid_hft:
+            try:
+                tf_s = _timeframe_seconds(settings.execution_timeframe)
+                if tf_s < 60:
+                    problems.append(
+                        f"execution_timeframe {settings.execution_timeframe!r} is sub-minute "
+                        f"-> risks the prohibited HFT/latency class; use >= 1m bars")
+            except ValueError:
+                problems.append(
+                    f"execution_timeframe {settings.execution_timeframe!r} is unparseable")
+        if self.forbid_hft and settings.risk.max_concurrent_positions > 5:
+            problems.append(
+                "max_concurrent_positions > 5 drifts toward HFT-like behavior")
+        return problems
+
+
+def _timeframe_seconds(tf: str) -> int:
+    """Minimal timeframe parser (kept here to avoid importing datafeed in config)."""
+    tf = tf.strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86_400, "w": 604_800}
+    if not tf or not tf[-1].isalpha() or not tf[:-1].isdigit() or tf[-1] not in units:
+        raise ValueError(f"invalid timeframe {tf!r}")
+    qty = int(tf[:-1])
+    if qty <= 0:
+        raise ValueError(f"invalid timeframe {tf!r}")
+    return qty * units[tf[-1]]
 
 
 # Sentinel: a numeric rule we have NOT verified from the firm's docs.
@@ -63,19 +134,24 @@ class PropRules:
     # Pacing / payout
     min_trading_days: int = 0
     time_limit_days: Optional[int] = None          # None = no limit
-    best_day_cap: Optional[float] = 0.20  # best day <= 20% of total profit (consistency)
+    best_day_cap: Optional[float] = None  # confirmed: NO consistency / best-day rule
     payout_split: float = 0.90
 
     # Policy
-    automation_allowed: Optional[bool] = None      # MUST confirm; None = unknown
+    # Confirmed: automation IS permitted, but ONLY via the documented public API
+    # (see AutomationPolicy below). Calling the website's internal/browser-network
+    # endpoints is prohibited, as are HFT/latency-arb/quote-stuffing/exploitation/
+    # cross-account/risk-limit-circumvention strategies. Automation never exempts
+    # any ordinary trading rule.
+    automation_allowed: bool = True
     instruments: tuple = ("BTC/USDT:USDT", "ETH/USDT:USDT")
 
     # --- confirmation flags: flip to True only when verified from live docs ---
     confirmed_targets: bool = True       # phase-1 target confirmed ($3k/$50k = 6%)
     confirmed_drawdown: bool = True      # MLL confirmed ($2k/$50k = 4%, static)
     confirmed_daily: bool = True         # DLL confirmed ($1k/$50k = 2%)
-    confirmed_consistency: bool = False  # best-day / consistency rule still unconfirmed
-    confirmed_automation: bool = False   # automation/API policy still unconfirmed
+    confirmed_consistency: bool = True   # confirmed: no consistency/best-day rule
+    confirmed_automation: bool = True    # confirmed: allowed via documented API only
 
     def all_confirmed(self) -> bool:
         return all(
@@ -143,6 +219,7 @@ class Settings:
     profile: Profile = Profile.SANDBOX
     rules: PropRules = field(default_factory=PropRules)
     risk: RiskConfig = field(default_factory=RiskConfig)
+    automation: AutomationPolicy = field(default_factory=AutomationPolicy)
     execution_timeframe: str = "15m"      # chosen execution TF (open question #4)
     session_filter: bool = True           # prefer London/NY killzones
 
@@ -150,8 +227,9 @@ class Settings:
         """Raise if this config is not safe to arm against a real evaluation.
 
         The scaffold's fail-closed gate: you cannot accidentally run the EVAL or
-        FUNDED profile on unverified placeholder rules, or with automation whose
-        legality you haven't confirmed.
+        FUNDED profile on unverified placeholder rules, with automation whose
+        legality you haven't confirmed, or with a configuration that would fall
+        into a prohibited automation class.
         """
         if self.profile is Profile.SANDBOX:
             return
@@ -160,6 +238,8 @@ class Settings:
             problems.append(
                 "automation is not confirmed ALLOWED — do not run a bot until verified"
             )
+        # Screen the configuration against the firm's prohibited automation classes.
+        problems.extend(self.automation.violations(self))
         if problems:
             raise ConfigNotConfirmedError(
                 f"Profile {self.profile.value!r} refuses to arm. Confirm from "
