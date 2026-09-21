@@ -44,14 +44,17 @@ class PropRules:
 
     account_size: float = 50_000.0
 
-    # Profit targets (fraction of start balance)
-    phase1_target: float = 0.10          # ~8-10% common
-    phase2_target: Optional[float] = 0.05  # None if single-phase
+    # Profit targets (fraction of start balance).
+    # Confirmed: $3,000 on a $50k account == 6%. Scales to other sizes.
+    phase1_target: float = 0.06          # $3,000 / $50,000
+    phase2_target: Optional[float] = None  # single-phase unless confirmed otherwise
 
-    # Drawdown
-    max_drawdown: float = 0.10           # overall
-    drawdown_type: DrawdownType = DrawdownType.UNKNOWN
-    daily_loss_limit: float = 0.05       # resets at reset hour
+    # Drawdown.
+    # Confirmed: MLL $2,000 on $50k == 4%, STATIC (floor = start_balance - 4%).
+    max_drawdown: float = 0.04           # $2,000 / $50,000
+    drawdown_type: DrawdownType = DrawdownType.STATIC
+    # Confirmed: DLL $1,000 on $50k == 2%. Resets at reset hour.
+    daily_loss_limit: float = 0.02       # $1,000 / $50,000
     daily_reset_hour_utc: int = 0        # 00:00 UTC common
 
     # Funded-only guards
@@ -68,11 +71,11 @@ class PropRules:
     instruments: tuple = ("BTC/USDT:USDT", "ETH/USDT:USDT")
 
     # --- confirmation flags: flip to True only when verified from live docs ---
-    confirmed_targets: bool = False
-    confirmed_drawdown: bool = False
-    confirmed_daily: bool = False
-    confirmed_consistency: bool = False
-    confirmed_automation: bool = False
+    confirmed_targets: bool = True       # phase-1 target confirmed ($3k/$50k = 6%)
+    confirmed_drawdown: bool = True      # MLL confirmed ($2k/$50k = 4%, static)
+    confirmed_daily: bool = True         # DLL confirmed ($1k/$50k = 2%)
+    confirmed_consistency: bool = False  # best-day / consistency rule still unconfirmed
+    confirmed_automation: bool = False   # automation/API policy still unconfirmed
 
     def all_confirmed(self) -> bool:
         return all(
@@ -119,11 +122,13 @@ class RiskConfig:
     """Our OWN discipline — always stricter than the firm's. The risk engine
     enforces the *tighter* of (firm rule, our rule)."""
 
-    per_trade_risk: float = 0.0035        # 0.35% of balance per trade (DESIGN.md §5: 0.25-0.5%)
+    # Tightened for the confirmed 2% DLL / 4% static MLL box (a much smaller
+    # room than the old 5%/10% placeholders — see DESIGN.md §5).
+    per_trade_risk: float = 0.002         # 0.2% of balance per trade
     # Personal daily stop = fraction of the FIRM's daily limit we allow ourselves to lose.
-    daily_stop_fraction_of_firm: float = 0.50   # stop the day at half the firm's daily limit
+    daily_stop_fraction_of_firm: float = 0.40   # stop the day at 40% of DLL (~0.8% of acct)
     # Internal max-DD buffer: stop well inside the firm's floor (fraction of firm max DD).
-    internal_dd_fraction_of_firm: float = 0.60   # use only 60% of the allowed drawdown
+    internal_dd_fraction_of_firm: float = 0.50   # halt at 50% of MLL (~2% of acct), half the floor as buffer
     max_concurrent_positions: int = 1
     max_total_open_risk: float = 0.01     # sum of open-position risk <= 1% of balance
     # Kill-switch: if remaining daily/DD budget drops below this fraction, stop trading.
