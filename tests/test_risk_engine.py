@@ -32,12 +32,12 @@ def make_engine(**rule_overrides):
 class TestSizing(unittest.TestCase):
     def test_size_matches_per_trade_risk(self):
         eng = make_engine()
-        # 0.35% of 50k = $175 risk; stop 100 away => 1.75 units
+        # 0.2% of 50k = $100 risk; stop 100 away => 1.0 units
         t = ProposedTrade("BTC", "long", entry=30_000, stop=29_900)
         v = eng.vet(t)
         self.assertTrue(v.approved)
-        self.assertAlmostEqual(v.risk_abs, 175.0, places=2)
-        self.assertAlmostEqual(v.approved_size, 1.75, places=4)
+        self.assertAlmostEqual(v.risk_abs, 100.0, places=2)
+        self.assertAlmostEqual(v.approved_size, 1.0, places=4)
 
     def test_never_exceeds_configured_risk(self):
         """Even if the trade asks for more, the engine caps at configured max."""
@@ -45,8 +45,8 @@ class TestSizing(unittest.TestCase):
         t = ProposedTrade("BTC", "long", entry=30_000, stop=29_900,
                           intended_risk_frac=0.05)  # asks for 5%!
         v = eng.vet(t)
-        # capped to 0.35% -> $175, not $2500
-        self.assertLessEqual(v.risk_abs, 175.0 + 1e-6)
+        # capped to 0.2% -> $100, not $2500
+        self.assertLessEqual(v.risk_abs, 100.0 + 1e-6)
 
 
 class TestGuardsBlock(unittest.TestCase):
@@ -76,28 +76,32 @@ class TestGuardsBlock(unittest.TestCase):
 class TestDailyAndDrawdown(unittest.TestCase):
     def test_daily_loss_reduces_then_halts(self):
         eng = make_engine()
-        # Internal daily budget = 50% of firm 5% of 50k = $1250.
-        self.assertAlmostEqual(eng.internal_daily_budget(), 1250.0, places=2)
+        # Internal daily budget = 40% of firm 5% of 50k = $1000.
+        self.assertAlmostEqual(eng.internal_daily_budget(), 1000.0, places=2)
         # Book a loss that eats most of the daily budget.
-        eng.on_fill_closed(-1100.0)   # $150 left of internal budget
+        eng.on_fill_closed(-900.0)   # $100 left of internal budget
         t = ProposedTrade("BTC", "long", entry=30_000, stop=29_900)
         v = eng.vet(t)
-        # remaining budget (150) < kill-switch fraction (15% of 1250 = 187.5) -> halt
+        # remaining budget (100) < kill-switch fraction (15% of 1000 = 150) -> halt
         self.assertEqual(v.decision, Decision.BLOCK)
         self.assertTrue(eng.state.halted_today)
 
     def test_reduce_when_budget_tight(self):
-        eng = make_engine()
-        # Leave ~ $300 of daily budget: desired risk 175 fits, but push DD budget low.
-        eng.on_fill_closed(-950.0)   # 300 left of internal daily budget (1250-950)
-        t = ProposedTrade("BTC", "long", entry=30_000, stop=29_900)
-        v = eng.vet(t)
-        # 300 remaining > kill fraction 187.5, desired risk < 300 -> APPROVE full.
-        # NOTE: risk sizes off CURRENT balance ($49,050 after the loss), so the
-        # desired risk is 0.35% * 49_050 = $171.675, NOT $175. This is correct:
-        # per-trade risk always tracks live balance.
+        # Force a REDUCE via the total-open-risk cap (independent of the daily/DD
+        # buffer fractions, so it stays valid as those are tuned).
+        # desired per-trade risk = 0.2% of 50k = $100; open-risk cap = 1% = $500.
+        rules = PropRules(account_size=50_000.0, max_drawdown=0.10,
+                          daily_loss_limit=0.05, drawdown_type=DrawdownType.STATIC)
+        eng = RiskEngine(Settings(rules=rules, risk=RiskConfig(max_concurrent_positions=2)),
+                         AccountState.new(rules.account_size))
+        # An existing position consumes $430 of the $500 open-risk room.
+        first = ProposedTrade("AAA", "long", entry=30_000, stop=29_570)  # 430 dist @ size 1
+        eng.register_open(first, 1.0)
+        v = eng.vet(ProposedTrade("BTC", "long", entry=30_000, stop=29_900))
+        # only $70 of open-risk room left < desired $100 -> REDUCE to $70.
+        self.assertEqual(v.decision, Decision.REDUCE)
         self.assertTrue(v.approved)
-        self.assertAlmostEqual(v.risk_abs, 49_050.0 * 0.0035, places=2)
+        self.assertAlmostEqual(v.risk_abs, 70.0, places=2)
 
     def test_day_roll_resets_halt(self):
         eng = make_engine()
