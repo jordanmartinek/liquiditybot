@@ -26,22 +26,32 @@ only ever **reduce or block** risk, never add it. (Full rationale in `DESIGN.md`
 ```
 DESIGN.md                     architecture, validation plan, prop tactics, RULES table
 src/liq_ai_bot/
-  config.py                   Settings + PropRules (placeholder rules + confirm flags), RiskConfig
+  config.py                   Settings + PropRules (confirmed rules) + AutomationPolicy + RiskConfig
   types.py                    Bar, Level, Setup, DOLState, enums
-  strategy.py                 deterministic core: level tracking, DOL gravity model, SFP trigger
+  levels.py                   M2 level engine: PDH/PDL·PWH/PWL·PMH/PML·sessions·swings·EQ·OB·confluence
+  strategy.py                 deterministic core: DOL gravity model + SFP trigger over the level map
   risk_engine.py              THE hard-constraint layer (two DD trackers, daily stop, kill-switch)
+  datafeed.py                 real OHLCV -> Bar (csv/ccxt/synthetic), validation, CSV round-trip
   backtest.py                 event-driven harness + Monte-Carlo pass/breach simulator
 examples/demo.py              end-to-end smoke test on synthetic data (no network)
-tests/test_risk_engine.py     unit tests for the risk guards + the "never adds risk" invariant
+examples/backtest_real.py     backtest runner over csv/ccxt/synthetic sources
+tests/                        risk engine · strategy · levels · datafeed · config/policy
 ```
 
-## Status: M1 (scaffold)
+## Status: M2 (full strategy + confirmed rules)
 
-Runnable, tested, **offline, no live connectivity, no real money**. The strategy's
-level-seeding (PDH/PDL, sessions, equal highs/lows, HTF swings, full confluence
-model) and the real data feed are **stubbed for M2**. The `RULES` are conservative
-**placeholders** — every rule is flagged `confirmed=False` and the `EVAL`/`FUNDED`
-profiles refuse to arm until you fill them from the firm's live docs.
+Runnable, tested, **offline, no live connectivity, no real money**. The level
+engine (`levels.py`) is a faithful port of the LiquidityRadar Pine indicator:
+previous-period levels, sessions, swings (+HTF), equal highs/lows, order blocks,
+the live dealing range, and a real 0-100 confluence score — wired into the SFP
+strategy. The prop `RULES` are **confirmed** (2% DLL / 4% static MLL / 6% target,
+no consistency rule, automation allowed via documented API only), so an `EVAL`
+profile now arms; the fail-closed gate still refuses configs that drift into a
+prohibited automation class.
+
+> Honesty check: the framework is complete, but a demonstrated **edge** is not.
+> Backtest on real data (M2 feed) then run the walk-forward / OOS / cost gates
+> (DESIGN.md §4) before trusting any pass/breach number.
 
 ## Requirements & running
 
@@ -84,7 +94,7 @@ by the M1 code.
 ## Roadmap
 
 - **M1 (done):** scaffold — config/RULES, risk engine, strategy interfaces, backtest + Monte-Carlo, tests.
-- **M2 (in progress):** real historical perp data feed (`datafeed.py`: csv/ccxt/synthetic) + real-data backtest runner + strategy/datafeed tests **[done]**; port full level/confluence logic from the Pine indicator **[next]**.
+- **M2 (done):** real historical perp data feed (`datafeed.py`: csv/ccxt/synthetic) + real-data backtest runner; **full level/confluence port** from the Pine indicator (`levels.py`: PDH/PDL, PWH/PWL, PMH/PML, sessions, swings +HTF, equal highs/lows, order blocks, dealing-range OTE, 0-100 confluence) wired into the strategy; tests throughout.
 - **M3:** Monte-Carlo challenge sim through the risk layer → P(pass)/P(breach).
 - **M4:** walk-forward + cost modeling → go/no-go on the base edge.
 - **M5 (only if M4 passes):** optional ML setup-filter trained on the journaled dataset.

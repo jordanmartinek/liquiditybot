@@ -19,6 +19,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, List, Optional, Protocol
 
+from .levels import LevelEngine, LevelParams
 from .types import Bar, Bias, DOLState, Level, LevelType, PoolSide, Setup, Side
 
 
@@ -79,27 +80,55 @@ class Rolling:
 
 
 # ---- DOL gravity model (ported from indicator's f_pull) ---------------------
+# Level-type importance weights (Pine f_pull typeW table). EQ (engineered
+# liquidity) ranks at the top with monthly/HTF; sessions pull least.
+_TYPE_WEIGHT = {
+    LevelType.EQ_H: 2.4, LevelType.EQ_L: 2.4,
+    LevelType.PMH: 2.2, LevelType.PML: 2.2,
+    LevelType.PWH: 1.9, LevelType.PWL: 1.9,
+    LevelType.PDH: 1.6, LevelType.PDL: 1.6,
+    LevelType.SESSION_H: 1.2, LevelType.SESSION_L: 1.2,
+    LevelType.SWING_H: 1.0, LevelType.SWING_L: 1.0,
+}
+
+
 @dataclass
 class DOLParams:
-    near_bias: float = 1.6        # distance-decay exponent (nearer pools pull harder)
-    eq_weight: float = 2.4        # equal highs/lows are the strongest magnets
+    near_bias: float = 1.5        # distance-decay exponent add-on (Pine dolNearBias)
+    sens: float = 1.0             # gravity sensitivity (Pine dolSens: Low .5/Med 1/High 2)
     freshness_atr: float = 0.15   # a level touched within this ATR fraction is "fresh"
     freshness_factor: float = 0.6
     conviction_floor: float = 0.15
+    use_type: bool = True         # weight by level importance (Pine dolUseType)
+    use_age: bool = True          # weight by resting time (Pine dolUseAge)
+    use_confluence: bool = True   # amplify pull by the level's own confluence (dolConfW)
+    now_ts: Optional[int] = None  # current bar ts, for the age factor (set by caller)
 
 
 def _level_pull(level: Level, price: float, atr: float, p: DOLParams) -> float:
-    """Per-level pull toward `price`. Mirrors the Pine f_pull(): distance-decay ×
-    type-weight × freshness × confluence. Age is left to the caller (M2)."""
+    """Per-level pull toward `price`. Faithful port of Pine f_pull():
+    distance-decay × type-weight × age × freshness × confluence."""
     if level.swept or atr <= 0:
         return 0.0
-    dist = abs(level.price - price) / atr
-    dist = max(dist, 1e-6)
-    decay = math.pow(1.0 / (1.0 + dist), p.near_bias)
-    type_w = p.eq_weight if level.ltype in (LevelType.EQ_H, LevelType.EQ_L) else 1.0
-    fresh = p.freshness_factor if dist <= p.freshness_atr else 1.0
-    conf = 1.0 + level.confluence / 100.0
-    return decay * type_w * fresh * conf
+    dist = abs(level.price - price)
+    # sharper decay so the nearest pool dominates (dolNearBias raises the exponent)
+    decay = math.pow(1.0 / (1.0 + p.sens * (dist / atr)), 1.0 + p.near_bias)
+    # type weight, scaled by sensitivity: typeW = 1 + (base - 1) * sens
+    type_w = 1.0
+    if p.use_type:
+        base = _TYPE_WEIGHT.get(level.ltype, 1.0)
+        type_w = 1.0 + (base - 1.0) * p.sens
+    # age weight: older resting liquidity pulls harder (log-scaled)
+    age_w = 1.0
+    if p.use_age and p.now_ts is not None and level.birth_ts:
+        age_bars = max(0.0, (p.now_ts - level.birth_ts))
+        # normalize age in ATR-independent "resting" terms via log
+        age_w = 1.0 + min(1.0, math.log1p(age_bars) / 15.0) * p.sens
+    # freshness discount: a level price is sitting right on is being tested
+    fresh = p.freshness_factor if (dist / atr) < p.freshness_atr else 1.0
+    # confluence amplifier: 1.0 .. 2.0
+    conf = (1.0 + level.confluence / 100.0) if p.use_confluence else 1.0
+    return decay * type_w * age_w * fresh * conf
 
 
 def compute_dol(levels: List[Level], price: float, atr: float,
@@ -149,46 +178,64 @@ class Strategy(Protocol):
 class LiquiditySFPStrategy:
     """The deterministic core. Tracks levels, computes DOL, fires on sweep+reversal.
 
-    Level seeding (PDH/PDL, sessions, equal highs/lows, HTF swings) is stubbed:
-    M2 wires in real session/day boundaries and the confluence model. For now
-    swing highs/lows are auto-tracked so the engine is runnable end-to-end.
+    M2: level seeding is now the full port of the LiquidityRadar indicator via
+    `LevelEngine` — PDH/PDL, PWH/PWL, PMH/PML, sessions, swings (+HTF), and equal
+    highs/lows, each carrying a real 0-100 confluence score. The engine is fed one
+    closed bar per `on_bar`, and the strategy reads its un-swept level map to detect
+    sweeps, compute DOL bias, and fire SFP setups.
+
+    A level is considered swept THIS bar when the engine drops it from its map
+    while the current bar's wick pierced it (SSL low undercut / BSL high exceeded).
+
+    Levels can still be seeded manually via `add_level` (used by focused tests);
+    those live alongside the engine-produced map.
     """
 
     def __init__(self, symbol: str, params: Optional[SignalParams] = None,
-                 rolling: Optional[Rolling] = None, dol_params: Optional[DOLParams] = None):
+                 dol_params: Optional[DOLParams] = None,
+                 level_params: Optional[LevelParams] = None,
+                 engine: Optional[LevelEngine] = None,
+                 auto_seed: bool = True):
         self.symbol = symbol
         self.p = params or SignalParams()
-        self.roll = rolling or Rolling()
         self.dol_params = dol_params or DOLParams()
-        self.levels: List[Level] = []
+        self.engine = engine or LevelEngine(level_params)
+        # When False the engine still tracks ATR/volume but does NOT contribute its
+        # seeded level map — the strategy runs purely off manually-added levels.
+        # (Used by focused SFP-trigger unit tests; production leaves it True.)
+        self.auto_seed = auto_seed
+        # rolling volume (for the rvol confirmation gate; ATR comes from the engine)
+        self.roll = Rolling(vol_len=20)
+        self._manual_levels: List[Level] = []
         self._last_bias: Optional[DOLState] = None
+
+    @property
+    def levels(self) -> List[Level]:
+        """Current un-swept level map: engine-seeded levels (if auto_seed) + manual."""
+        seeded = self.engine.levels() if self.auto_seed else []
+        return seeded + [lv for lv in self._manual_levels if not lv.swept]
 
     # --- level bookkeeping ---------------------------------------------------
     def add_level(self, level: Level) -> None:
-        self.levels.append(level)
+        """Seed a level manually (alongside the engine's map)."""
+        self._manual_levels.append(level)
 
-    def _track_swings(self, bar: Bar) -> None:
-        sw = self.roll.confirmed_swing()
-        if sw is None:
-            return
-        kind, pivot = sw
-        if kind == "high":
-            self.levels.append(Level(pivot.high, LevelType.SWING_H, PoolSide.BSL,
-                                     pivot.ts, confluence=50.0))
-        else:
-            self.levels.append(Level(pivot.low, LevelType.SWING_L, PoolSide.SSL,
-                                     pivot.ts, confluence=50.0))
-
-    def _mark_swept(self, bar: Bar) -> List[Level]:
-        """Mark levels the current bar's wick pierced; return those swept THIS bar."""
+    def _mark_swept(self, bar: Bar, levels: List[Level]) -> List[Level]:
+        """Return levels whose wick was pierced by THIS bar (SSL low / BSL high),
+        and mark manual levels swept. Engine levels are dropped by the engine
+        itself once swept, so we detect the piercing on the pre-update snapshot."""
         swept_now: List[Level] = []
-        for lv in self.levels:
+        for lv in levels:
             if lv.swept:
                 continue
             if lv.side is PoolSide.SSL and bar.low < lv.price:
-                lv.swept = True; lv.swept_ts = bar.ts; swept_now.append(lv)
+                swept_now.append(lv)
+                if lv in self._manual_levels:
+                    lv.swept = True; lv.swept_ts = bar.ts
             elif lv.side is PoolSide.BSL and bar.high > lv.price:
-                lv.swept = True; lv.swept_ts = bar.ts; swept_now.append(lv)
+                swept_now.append(lv)
+                if lv in self._manual_levels:
+                    lv.swept = True; lv.swept_ts = bar.ts
         return swept_now
 
     def _opposing_pool(self, side: Side, price: float) -> Optional[Level]:
@@ -203,10 +250,19 @@ class LiquiditySFPStrategy:
 
     # --- main entry point ----------------------------------------------------
     def on_bar(self, bar: Bar) -> Optional[Setup]:
+        # snapshot the level map BEFORE this bar updates the engine, so we can
+        # detect which levels THIS bar's wick pierced (the engine drops swept
+        # levels during its own update).
+        pre_levels = self.levels
+        swept_now = self._mark_swept(bar, pre_levels)
+
+        # advance the engine (seeds/refreshes levels, ATR, order blocks) and volume
+        self.engine.on_bar(bar)
         self.roll.update(bar)
-        atr = self.roll.atr
-        self._track_swings(bar)
-        swept_now = self._mark_swept(bar)
+        atr = self.engine.atr
+
+        # DOL over the fresh, un-swept map (age factor needs the current ts)
+        self.dol_params.now_ts = bar.ts
         dol = compute_dol(self.levels, bar.close, atr, self.dol_params)
         self._last_bias = dol
 

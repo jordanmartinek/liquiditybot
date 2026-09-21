@@ -165,7 +165,7 @@ No live money until each gate passes. Order matters.
 
 - **M0 (this doc):** design + prerequisites.
 - **M1:** Python scaffold — config/RULES, risk-engine skeleton, strategy interfaces, backtest harness stub (see `/src`). No live connectivity.
-- **M2:** port the deterministic strategy from the Pine logic; backtest on historical perp data.
+- **M2 (done):** ported the deterministic strategy from the Pine logic — full level engine (`levels.py`: PDH/PDL, PWH/PWL, PMH/PML, sessions, swings +HTF, equal highs/lows, order blocks, dealing-range OTE, 0-100 confluence) wired into the SFP strategy; real data feed (`datafeed.py`) + backtest runner for historical perp data.
 - **M3:** prop-challenge Monte-Carlo simulation through the risk layer → P(pass)/P(breach).
 - **M4:** walk-forward + cost modeling; decide go/no-go on the base edge.
 - **M5 (only if M4 passes):** optional ML setup-filter trained on the journaled dataset.
